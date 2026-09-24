@@ -31,7 +31,8 @@ Status: discovery / pre-planning. Based on a read-through of this repository at
 | Python | **Keep CPython, embedded and statically linked.** Do not replace it. | CPython already is an interpreter. Blender's UI is written in Python. See §0.2. |
 | `fork`/`exec` | **Threads plus in-process replacements.** No subprocesses. | The C code barely depends on subprocesses on Apple. See §0.3. |
 | Input | **Keyboard and trackpad work day one. Apple Pencil gets first-class support.** | See §0.4. |
-| Hardware | **M-series iPads only (M1+), iPadOS 26 minimum.** | See §0.5. |
+| Hardware / OS | **M-series iPads only (M1+). Deployment target iPadOS 18, built with the latest SDK, tested on 18 and 26.** | See §0.5. |
+| Scope | **Full Blender** (all editors and modes), not a cut-down companion app. | See §0.6. |
 
 ### 0.1 Dual license? No. Plan for TestFlight, with caveats
 - Only **copyright holders** can offer a second license. Blender is `GPL-2.0-or-later` with
@@ -82,7 +83,7 @@ extra run time. The audit shows the dependency is small:
 | Play rendered animation (`screen_play_rendered_anim.py`) | Launches a second Blender | Play inside the Image or Sequencer editor, or use AVPlayer. |
 | External text editor, system info, i18n tools | Python `subprocess` | Disable on iOS. |
 | Heavy compute (render, bake, simulation, remesh) | Already threads (TBB / `BLI_task`) | Nothing to change. Add memory-pressure handling. |
-| Long render while the app is in the background | n/a | `BGContinuedProcessingTask` (iPadOS 26) keeps *this* process running with user-visible progress. Otherwise autosave and pause. |
+| Long render while the app is in the background | n/a | iPadOS 26: `BGContinuedProcessingTask` keeps *this* process running with user-visible progress. iPadOS 18: `beginBackgroundTask` (about 30 s) to finish the current tile, then autosave and pause. Resume when the app returns. |
 
 ### 0.4 First-class Apple Pencil (keyboard and trackpad also work)
 Keyboard and trackpad reuse the existing Cocoa-style paths (`UIKey` → `GHOST_kEventKey*`,
@@ -110,8 +111,20 @@ use tablet pressure and tilt, so the gain is highest there.
 ### 0.5 M-series only
 - **Devices:** iPad Pro (M1 2021 and later), iPad Air (M1 2022 and later). 8 GB+ RAM on all of them,
   16 GB on 1 TB+ Pro models.
-- **Minimum OS: iPadOS 26.** Every M-series iPad runs it. You get `BGContinuedProcessingTask`,
-  the windowed multitasking model, and one API surface to test.
+- **Minimum OS: iPadOS 18** (`IPHONEOS_DEPLOYMENT_TARGET=18.0`), built against the latest SDK.
+  Every M-series iPad runs 18 and 26. Everything the plan relies on already exists in 18:
+
+  | API | Available since | On iPadOS 18 |
+  |---|---|---|
+  | Metal 3, `MTLGPUFamilyApple7+`, ray-tracing intersection | 16 | ✅ |
+  | Pencil hover (`UIHoverGestureRecognizer`, `zOffset`) | 16.1 | ✅ |
+  | Pencil Pro squeeze, `rollAngle`, `UICanvasFeedbackGenerator` | 17.5 | ✅ |
+  | CPython official iOS support (PEP 730, 3.13+) | 3.13 | ✅ (iOS 13+) |
+  | `BGContinuedProcessingTask` (long renders in the background) | **26** | ❌ Use the `@available` fallback from §0.3 |
+  | New iPadOS 26 windowing (free-form windows, menu bar) | **26** | ❌ 18 uses Stage Manager and Split View. Both work through `UIScene` if the GHOST window follows the scene size and does not assume fixed sizes. Add `UIMenuBuilder` menus on 26. |
+
+  Guard 26-only calls with `if (@available(iOS 26.0, *))`. CI needs both an 18.x and a 26.x
+  device or simulator run.
 - **Why this simplifies things:**
   - One GPU family (`MTLGPUFamilyApple7`+), always unified memory. This fits Cycles' existing
     Apple-Silicon-only filter.
@@ -120,7 +133,38 @@ use tablet pressure and tilt, so the gain is highest there.
   - MetalRT is available on Apple9 (M3/M4 iPads) and falls back to Cycles' BVH elsewhere.
 - **Tiering:** Pencil Pro features (squeeze, barrel roll, haptics) need M2+ Air or M4+ Pro. Hover
   needs M2+. Detect these at runtime and do not gate the app on them.
-- Request `com.apple.developer.kernel.increased-memory-limit` and test on 8 GB M1 as the floor.
+- Request `com.apple.developer.kernel.increased-memory-limit` and test on 8 GB M1 running
+  **iPadOS 18** as the floor device. That is the worst case for both memory and APIs.
+
+### 0.6 Full Blender scope
+Goal: the same editors, modes and file compatibility as desktop. The only differences should be
+features the platform makes impossible. Keyboard and trackpad give desktop parity. Touch and
+Pencil are added on top, not a replacement UI.
+
+**Dependency plan for full scope** (`build_files/build_environment/cmake`):
+
+| Status | Libraries | Notes |
+|---|---|---|
+| ✅ Port as-is (arm64-iOS cross-compile) | zlib, zstd, png, jpeg, webp, tiff, openjpeg, openjph, freetype, harfbuzz, fribidi, expat, pugixml, xml2, fmt, tbb, imath, openexr, OpenColorIO, OpenImageIO, OpenSubdiv, Embree (NEON via `sse2neon`), OpenImageDenoise (arm64 uses BNNS/Accelerate, which exists on iOS), OpenPGL, Alembic, Draco, fftw, gmp, manifold, potrace, sndfile, ogg/vorbis/flac/opus, sqlite, ssl, yamlcpp, thorvg, haru, meshoptimizer, libheif, brotli, deflate, blosc, lzma | Mostly autotools/CMake with an iOS toolchain file. Build **static** or as embedded frameworks. |
+| 🟠 Port with effort | **Python + numpy** (static CPython, numpy built for iOS), **USD** (large; plugin system uses `dlopen`, so link plugins statically or embed them as frameworks), **OpenVDB / NanoVDB**, **MaterialX**, **FFmpeg** (+ x264/x265/vpx/aom/theora/lame; GPL is fine because the app is GPL, but codec patents are a risk, so prefer VideoToolbox hardware encode/decode through FFmpeg), **OpenAL** (use Apple's built-in OpenAL or switch the Audaspace backend to CoreAudio), Rubberband, Ceres | Budget most of Phase 1 here. |
+| ❌ Not possible / not applicable | **LLVM + OSL** (JIT is forbidden. Cycles SVM still runs every built-in node; only OSL Script nodes and OSL-only features are lost), **OpenXR / VR** (no runtime on iPad), **Vulkan, epoxy/OpenGL, shaderc** (Metal only), **SDL, Wayland, X11, dbus, JACK, spnav/3Dconnexion**, **CUDA/HIP/oneAPI/level-zero** (Metal only) | Turn off with the existing `WITH_*` options. The UI already hides these features when they are off. |
+
+**What "full" costs:**
+- **Size:** expect 500 MB – 1 GB installed. Ship essential assets in the bundle. Put optional
+  content (the full asset library, extra fonts, locale files) in On-Demand Resources or the
+  Background Assets framework.
+- **Memory:** full scenes on an 8 GB iPad are the real limit, not the feature list. Hook
+  `didReceiveMemoryWarning` into Blender to reduce undo steps, free GPU texture caches and trim
+  image buffers.
+- **UX coverage:** every editor must be usable, so the touch work is systemic:
+  - a global touch keymap
+  - a larger UI scale preset
+  - long-press opens the context menu
+  - an on-screen modifier bar for Ctrl/Shift/Alt
+  - two-finger navigation in every 2D and 3D editor
+  - Pencil-specific behavior in paint, sculpt and Grease Pencil
+- **Testing:** run Blender's existing `tests/` (Python and GTest) on device in headless mode.
+  This keeps parity measurable.
 
 ---
 
@@ -228,7 +272,7 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 | P4 | **CPU JIT (LLVM / OSL).** | 🔴 | iOS disallows writable+executable memory for third-party apps. Build with `WITH_CYCLES_OSL=OFF` and `WITH_LLVM=OFF`. Cycles SVM shading still works, so the impact is small. |
 | P5 | **Licensing: GPL v3 and the App Store.** | 🔴 → TestFlight, see §0.1 | Blender is GPL. App Store terms (DRM, usage restrictions) are widely considered incompatible with GPL. This is why VLC was pulled in 2011. Blender Foundation and all copyright holders would have to agree, or distribution would have to use TestFlight / enterprise / EU alternative marketplaces (DMA). **Get a legal opinion before anything else.** |
 | P6 | **Codec licensing.** | 🟡 | FFmpeg with x264/x265 raises patent and licensing questions. Use `AVFoundation`/`VideoToolbox` for video I/O on iOS instead. |
-| P7 | **Background execution.** | 🟡 | iPadOS suspends backgrounded apps, so long renders stop. Use `BGProcessingTask` / `BGContinuedProcessingTask` (iPadOS 26) or warn the user. Autosave on `sceneDidEnterBackground`. |
+| P7 | **Background execution.** | 🟡 | iPadOS suspends backgrounded apps, so long renders stop. Use `BGContinuedProcessingTask` on iPadOS 26, `beginBackgroundTask` + pause on iPadOS 18. Autosave on `sceneDidEnterBackground`. |
 
 ---
 
@@ -237,7 +281,8 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 | Phase | Goal | Key work | Exit criteria |
 |---|---|---|---|
 | 0. Validate (1–2 wks) | De-risk licensing and policy | Legal read on GPL + App Store (P5), App Review stance on Python (P1). Choose a distribution channel. | Go/no-go on channel. |
-| 1. Headless core (4–6 wks) | Blender builds and runs `-b` on iPad | `platform_ios.cmake`, iOS dep builds for a minimal set, `WITH_HEADLESS`, Python off or static, no OSL/LLVM/USD/VDB/FFmpeg, `BLI_subprocess` stubbed. | Load a `.blend`, evaluate the depsgraph, render one Cycles frame on-device (unit tests pass). |
+| 1a. Headless core (4–6 wks) | Blender builds and runs `-b` on iPad | `platform_ios.cmake` (deployment target 18.0), iOS builds of the ✅ dependencies, `WITH_HEADLESS`, static CPython, `BLI_subprocess` compiled out. | Load a `.blend`, evaluate the depsgraph, render one Cycles frame on an iPadOS 18 device. |
+| 1b. Full dependency set (6–10 wks, overlaps phase 2) | Full-scope feature parity for the core | Port the 🟠 dependencies (numpy, USD, OpenVDB, MaterialX, FFmpeg, audio). Run Blender's `tests/` on device. | Test-suite pass rate on device matches macOS arm64, apart from the ❌ features. |
 | 2. Metal viewport + UIKit GHOST (8–12 wks) | Interactive, desktop-parity UI on iPad | `GHOST_SystemUIKit`/`WindowUIKit`, `CAMetalLayer` context, fix `MTLStorageModeManaged` (G1) and the OS gating (G2), gestures → trackpad events, Pencil → `GHOST_TabletData`, keyboard/trackpad via Magic Keyboard. | EEVEE viewport at 60 fps on a mid-size scene. Sculpt and Grease Pencil usable with Pencil. |
 | 3. Touch-first UX (ongoing) | Usable without a keyboard | Touch keymap, larger UI scale, on-screen modifier bar, long-press menus, Files-app document picker, iCloud, autosave and state restoration. | Usability test with 5 artists completing a sculpt or storyboard task. |
 | 4. Ecosystem | Scripting and add-ons | Static Python + bundled add-ons, policy-compliant scripting mode, precompiled Metal archives. | Depends on the Phase 0 decision. |
@@ -246,8 +291,8 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 
 ## 5. Open questions
 1. ~~Distribution~~: **TestFlight** (fallbacks: EU alternative marketplace, Ad Hoc). See §0.1.
-2. Target scope: full Blender, or a focused "Blender Sculpt / Grease Pencil" app from the same codebase?
-3. ~~Minimum hardware~~: **M1+, iPadOS 26.** See §0.5.
+2. ~~Target scope~~: **Full Blender.** See §0.6.
+3. ~~Minimum hardware~~: **M1+, iPadOS 18 deployment target.** See §0.5.
 4. Should the UIKit GHOST backend also target visionOS (shared UIKit and Metal base)?
 5. Maintained upstream (merged behind `WITH_GHOST_UIKIT`), or as a downstream fork?
 6. Will you ask the Blender Foundation for a statement of no objection before the first external TestFlight build?
