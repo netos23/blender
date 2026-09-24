@@ -23,6 +23,107 @@ Status: discovery / pre-planning. Based on a read-through of this repository at
 
 ---
 
+## 0. Decisions (round 2)
+
+| Topic | Decision | Rationale |
+|---|---|---|
+| Licensing / channel | **TestFlight first.** Dual licensing is not possible for the fork. | See §0.1. |
+| Python | **Keep CPython, embedded and statically linked.** Do not replace it. | CPython already is an interpreter. Blender's UI is written in Python. See §0.2. |
+| `fork`/`exec` | **Threads plus in-process replacements.** No subprocesses. | The C code barely depends on subprocesses on Apple. See §0.3. |
+| Input | **Keyboard and trackpad work day one. Apple Pencil gets first-class support.** | See §0.4. |
+| Hardware | **M-series iPads only (M1+), iPadOS 26 minimum.** | See §0.5. |
+
+### 0.1 Dual license? No. Plan for TestFlight, with caveats
+- Only **copyright holders** can offer a second license. Blender is `GPL-2.0-or-later` with
+  thousands of contributors and no copyright assignment, so a fork cannot relicense their code.
+  You *can* dual-license code you write yourself (for example a new `GHOST_SystemUIKit`), but
+  the combined app is still GPL.
+- **TestFlight is not a licensing loophole.** Testers still install through Apple's terms, and
+  external TestFlight builds go through Beta App Review. Guideline 2.2 expects them to be
+  "intended for public distribution" and to follow the App Review Guidelines, so the Python and
+  code-download rules (§0.2) still apply. The GPL risk is a copyright holder objecting, which is
+  what happened to VLC. In practice this risk is lower for a free, source-published beta, but it
+  is not zero.
+- **Operational limits:** 10,000 external testers, builds expire after 90 days (so you need a
+  steady release cadence), and a paid Apple Developer account.
+- **Ways to reduce risk:** publish full source for every build (GPL §6), add no extra
+  restrictions, ask the Blender Foundation for a statement of no objection, and keep an **EU
+  alternative marketplace** (for example AltStore PAL, which already hosts GPL apps) and **Ad
+  Hoc builds** (up to 100 iPads for internal testers) as fallbacks.
+- *Not legal advice. Get a real legal opinion before any public build.*
+
+### 0.2 Python: keep CPython (it is an interpreter). Control what code gets in
+- The App Store problem is not interpreters. Pythonista, Pyto, Carnets and a-Shell ship CPython.
+  The problems are **(a) JIT / writable+executable memory** and **(b) downloading code that adds
+  features** (Guideline 2.5.2). CPython has no JIT unless you enable 3.13+'s experimental one, so
+  keep it off. **CPython 3.13+ officially supports iOS (PEP 730).**
+- **Python cannot be dropped or swapped for a different language.** The whole UI layout (menus,
+  panels, headers) is Python: `scripts/startup/bl_ui/` has 81 modules. So do all operators in
+  `scripts/startup/bl_operators/`, all bundled add-ons, and the `bpy` API that drivers and
+  `.blend` scripts use. A replacement interpreter would mean rewriting every one of them.
+- **What has to change:**
+  - Link CPython statically. Ship native modules (`numpy`, `_ssl`, `_ctypes`, ...) as signed
+    `.framework`s inside the app bundle. BeeWare's `Python-Apple-support` is the reference.
+  - No `pip` and no runtime wheels. Remove or disable the online extension repository in
+    `scripts/addons_core/bl_pkg` and the downloader in `_bpy_internal/http/downloader.py`.
+  - Allow **pure-Python** add-ons and user scripts that the user brings in through the Files app,
+    editable in the Text Editor. This is the Pythonista-style "user-authored code" model. Keep
+    `WITH_PYTHON_SECURITY` on, so scripts embedded in `.blend` files need explicit consent.
+
+### 0.3 Replacing `fork`/`exec`: threads, not background processes
+iPadOS has no API to launch a child process, and "background tasks" only give *your own process*
+extra run time. The audit shows the dependency is small:
+
+| Use | Location | iOS replacement |
+|---|---|---|
+| GL shader compile subprocess (`BLI_subprocess.cc`) | `gpu/opengl/*` | Not built. iOS uses Metal, which already compiles shaders on worker threads (`mtl_shader.mm`, `GPU_max_parallel_compilations()`). |
+| Move to trash via `gio`/`kioclient` (`fileops_c.cc`) | Linux-only path | Not built. Use `NSFileManager trashItemAtURL` or delete directly. |
+| Open file/URL externally (`wm.py`, `file.py`, `image.py`) | Python `subprocess` → `open` | `UIApplication.open` / `UIDocumentInteractionController` / share sheet, called from a new `bpy` or GHOST hook. |
+| Play rendered animation (`screen_play_rendered_anim.py`) | Launches a second Blender | Play inside the Image or Sequencer editor, or use AVPlayer. |
+| External text editor, system info, i18n tools | Python `subprocess` | Disable on iOS. |
+| Heavy compute (render, bake, simulation, remesh) | Already threads (TBB / `BLI_task`) | Nothing to change. Add memory-pressure handling. |
+| Long render while the app is in the background | n/a | `BGContinuedProcessingTask` (iPadOS 26) keeps *this* process running with user-visible progress. Otherwise autosave and pause. |
+
+### 0.4 First-class Apple Pencil (keyboard and trackpad also work)
+Keyboard and trackpad reuse the existing Cocoa-style paths (`UIKey` → `GHOST_kEventKey*`,
+`UIPointerInteraction` + indirect pointer touches → cursor and buttons, trackpad pinch/rotate/scroll
+→ `GHOST_kTrackpadEvent*`). Pencil work, by feature:
+
+| Pencil feature | UIKit API | Blender mapping | Notes |
+|---|---|---|---|
+| Pressure | `UITouch.force / maximumPossibleForce` | `GHOST_TabletData.Pressure` | Expose a pressure curve. Blender already has one in Preferences > Input > Tablet. |
+| Tilt | `altitudeAngle`, `azimuthAngle(in:)` | `Xtilt`, `Ytilt` (projected vector, −1..1) | Same convention as the comment in `GHOST_Types.hh`. Watch the Y sign (Cocoa already flips it). |
+| 240 Hz samples | `coalescedTouches(for:)` | Emit each one as a cursor event. The WM already turns earlier queued moves into `INBETWEEN_MOUSEMOVE`, which paint and sculpt strokes consume. | This is the key to smooth strokes. |
+| Low latency | `predictedTouches(for:)` | Optional preview-only stroke extension | Never commit predicted points. |
+| Late force / azimuth | `estimatedPropertiesExpectingUpdates` + `touchesEstimatedPropertiesUpdated` | Either delay stroke samples slightly, or accept the first estimate. | Start by accepting the estimate. |
+| Hover (M2+ Pro, M2+ Air) | `UIHoverGestureRecognizer`, `zOffset` | Cursor move with `Active = Stylus`, `Pressure = 0` | Gives brush-cursor preview and tooltips, which fixes the biggest "no hover" UX gap. |
+| Barrel roll (Pencil Pro) | `UITouch.rollAngle` | **New** `GHOST_TabletData` field (for example `Twist`) → `wmTabletData` | Brush and texture rotation, Grease Pencil nib angle. Wacom Art Pens could later feed it on desktop too. |
+| Squeeze (Pencil Pro) | `UIPencilInteraction` squeeze | Configurable: open a pie menu or brush picker at the pen tip | Make it a keymap item so users can rebind it. |
+| Double-tap | `UIPencilInteraction` tap | Toggle eraser / last tool / undo | Respect the system `preferredTapAction`. |
+| Eraser semantics | n/a (Pencil has no eraser end) | Double-tap or squeeze toggles `GHOST_kTabletModeEraser` | Grease Pencil and texture paint already honor eraser mode. |
+| Palm rejection | `UITouch.type` `.pencil` vs `.direct` | While the pen is down, drop `.direct` touches. Fingers navigate, pen acts. | Add a preference: "Only Pencil draws". |
+| Haptics (Pencil Pro) | `UICanvasFeedbackGenerator` | Snap and increment feedback | Nice to have. |
+
+Priority workspaces: **Sculpt**, **Grease Pencil draw/animate**, **Texture paint**. These already
+use tablet pressure and tilt, so the gain is highest there.
+
+### 0.5 M-series only
+- **Devices:** iPad Pro (M1 2021 and later), iPad Air (M1 2022 and later). 8 GB+ RAM on all of them,
+  16 GB on 1 TB+ Pro models.
+- **Minimum OS: iPadOS 26.** Every M-series iPad runs it. You get `BGContinuedProcessingTask`,
+  the windowed multitasking model, and one API surface to test.
+- **Why this simplifies things:**
+  - One GPU family (`MTLGPUFamilyApple7`+), always unified memory. This fits Cycles' existing
+    Apple-Silicon-only filter.
+  - G1 (managed storage) is solved by always using `MTLStorageModeShared`.
+  - G2 becomes "treat iPad like an Apple Silicon Mac".
+  - MetalRT is available on Apple9 (M3/M4 iPads) and falls back to Cycles' BVH elsewhere.
+- **Tiering:** Pencil Pro features (squeeze, barrel roll, haptics) need M2+ Air or M4+ Pro. Hover
+  needs M2+. Detect these at runtime and do not gate the app on them.
+- Request `com.apple.developer.kernel.increased-memory-limit` and test on 8 GB M1 as the floor.
+
+---
+
 ## 1. Current state in the codebase
 
 | Area | Where | iPad relevance |
@@ -101,7 +202,7 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 ### 3.2 Graphics
 | # | Blocker | Severity | Notes |
 |---|---|---|---|
-| G1 | **`MTLStorageModeManaged` is macOS-only.** | 🟠 | Used in `mtl_vertex_buffer.mm` and `mtl_storage_buffer.mm`, with `didModifyRange` sync paths (~23 references). On iOS, use `Shared` (unified memory) and remove the manual sync. Apple Silicon Macs could share this path too. |
+| G1 | **`MTLStorageModeManaged` is macOS-only.** | 🟡 (M-series: always Shared) | Used in `mtl_vertex_buffer.mm` and `mtl_storage_buffer.mm`, with `didModifyRange` sync paths (~23 references). On iOS, use `Shared` (unified memory) and remove the manual sync. Apple Silicon Macs could share this path too. |
 | G2 | **The backend is hard-gated to macOS.** | 🟡 | `BLI_assert_msg(os == GPU_OS_MAC, ...)` and `supportsFamily:MTLGPUFamilyMac2` checks in `mtl_backend.mm` (supported-GPU check, barycentrics whitelist). Needs `MTLGPUFamilyApple7+` equivalents for iPad and a new `GPU_OS_IOS`. |
 | G3 | **Runtime shader compilation.** | 🟡 | `newLibraryWithSource` is used for the viewport and Cycles kernels. This is allowed on iOS (it is not a CPU JIT), but first-launch compile times on iPad will be long. Consider shipping precompiled `.metallib` archives / binary archives. |
 | G4 | **Memory limits.** | 🟠 | iPadOS terminates apps well below physical RAM (jetsam). The `com.apple.developer.kernel.increased-memory-limit` entitlement helps. Large scenes, Cycles BVH builds and undo stacks need memory pressure handling. |
@@ -121,11 +222,11 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 ### 3.4 Policy and runtime (App Store)
 | # | Blocker | Severity | Notes |
 |---|---|---|---|
-| P1 | **Embedded Python running downloaded code.** | 🔴 | App Review Guideline 2.5.2 forbids downloading and executing code that changes app functionality. Add-ons, the extensions platform (`scripts/addons_core/bl_pkg`), scripts embedded in `.blend` files (`WITH_PYTHON_SECURITY`) and drivers are all Python. Options: ship only bundled add-ons, disable remote extension install, and keep user scripting in an "educational/IDE"-style carve-out (Pythonista/Swift Playgrounds precedent). Needs a legal/App Review read before committing. |
+| P1 | **Embedded Python running downloaded code.** | 🟠 → resolved in §0.2 | App Review Guideline 2.5.2 forbids downloading and executing code that changes app functionality. Add-ons, the extensions platform (`scripts/addons_core/bl_pkg`), scripts embedded in `.blend` files (`WITH_PYTHON_SECURITY`) and drivers are all Python. Options: ship only bundled add-ons, disable remote extension install, and keep user scripting in an "educational/IDE"-style carve-out (Pythonista/Swift Playgrounds precedent). Needs a legal/App Review read before committing. |
 | P2 | **Python C extensions and wheels.** | 🔴 | iOS forbids `dlopen` of arbitrary unsigned dylibs. CPython 3.13+ has official iOS support (PEP 730), but every native module (numpy and the like) must be built as a signed framework inside the bundle. `pip`/wheel install at runtime is not possible. |
-| P3 | **`fork()` / `execv()`.** | 🔴 | `BLI_subprocess.cc` and the GL shader compilation subprocess. Also Python's `subprocess`, used by some add-ons and the extensions system. `fork` is unavailable to App Store apps. Compile out and fall back to threads. |
+| P3 | **`fork()` / `execv()`.** | 🟡 → see §0.3 | `BLI_subprocess.cc` and the GL shader compilation subprocess. Also Python's `subprocess`, used by some add-ons and the extensions system. `fork` is unavailable to App Store apps. Compile out and fall back to threads. |
 | P4 | **CPU JIT (LLVM / OSL).** | 🔴 | iOS disallows writable+executable memory for third-party apps. Build with `WITH_CYCLES_OSL=OFF` and `WITH_LLVM=OFF`. Cycles SVM shading still works, so the impact is small. |
-| P5 | **Licensing: GPL v3 and the App Store.** | 🔴 | Blender is GPL. App Store terms (DRM, usage restrictions) are widely considered incompatible with GPL. This is why VLC was pulled in 2011. Blender Foundation and all copyright holders would have to agree, or distribution would have to use TestFlight / enterprise / EU alternative marketplaces (DMA). **Get a legal opinion before anything else.** |
+| P5 | **Licensing: GPL v3 and the App Store.** | 🔴 → TestFlight, see §0.1 | Blender is GPL. App Store terms (DRM, usage restrictions) are widely considered incompatible with GPL. This is why VLC was pulled in 2011. Blender Foundation and all copyright holders would have to agree, or distribution would have to use TestFlight / enterprise / EU alternative marketplaces (DMA). **Get a legal opinion before anything else.** |
 | P6 | **Codec licensing.** | 🟡 | FFmpeg with x264/x265 raises patent and licensing questions. Use `AVFoundation`/`VideoToolbox` for video I/O on iOS instead. |
 | P7 | **Background execution.** | 🟡 | iPadOS suspends backgrounded apps, so long renders stop. Use `BGProcessingTask` / `BGContinuedProcessingTask` (iPadOS 26) or warn the user. Autosave on `sceneDidEnterBackground`. |
 
@@ -144,11 +245,12 @@ Severity: 🔴 must solve before any shippable build · 🟠 significant effort 
 ---
 
 ## 5. Open questions
-1. Distribution: App Store, TestFlight/beta only, or EU alternative marketplace? (drives P1, P2, P5)
+1. ~~Distribution~~: **TestFlight** (fallbacks: EU alternative marketplace, Ad Hoc). See §0.1.
 2. Target scope: full Blender, or a focused "Blender Sculpt / Grease Pencil" app from the same codebase?
-3. Minimum hardware: M1+ iPads only (recommended: same GPU family as supported Macs and 8 GB+ RAM), or A-series too?
+3. ~~Minimum hardware~~: **M1+, iPadOS 26.** See §0.5.
 4. Should the UIKit GHOST backend also target visionOS (shared UIKit and Metal base)?
 5. Maintained upstream (merged behind `WITH_GHOST_UIKIT`), or as a downstream fork?
+6. Will you ask the Blender Foundation for a statement of no objection before the first external TestFlight build?
 
 ## 6. Starting points for engineers
 - `intern/ghost/intern/GHOST_ISystem.cc`: backend selection. Add the UIKit case here.
