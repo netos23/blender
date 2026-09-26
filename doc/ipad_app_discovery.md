@@ -166,6 +166,40 @@ Pencil are added on top, not a replacement UI.
 - **Testing:** run Blender's existing `tests/` (Python and GTest) on device in headless mode.
   This keeps parity measurable.
 
+### 0.7 Prior art: `Shlok-Bhakta/blender-ios-build`
+Reviewed at `ad79172a` (2026-09-14). It is a Blender **5.2.0** fork. This repo is `main` (5.3 alpha).
+Its docs say it adapts an earlier **`ios` branch of Blender** ("donor" `a1de44dd`, a 213-file
+delta against v5.1.2) one subsystem at a time instead of merging it. We have not yet verified
+where that branch lives or how active it is.
+
+**It has already made the same decisions we did:** full-Blender profile (`blender_full` minus
+platform limits), iOS 18.0 deployment target, static CPython 3.13 with native modules packaged as
+frameworks, OSL off, Metal only, threads instead of subprocesses.
+
+| Area | Their state | vs. our plan |
+|---|---|---|
+| Build | `platform_ios.cmake`, `blender_ios_{device,sim}*.cmake`, iOS dependency recipes and patches (Embree, OCIO, USD, ...), content-addressed dependency cache, GitHub Actions on `macos-15` | Covers Phase 1a/1b. |
+| GHOST | `GHOST_SystemIOS` / `WindowIOS` / `ContextIOS` (~7k lines), a single `UIWindowScene`, MTKView drawable as the pixel authority, hardware keyboard, trackpad, software keyboard bridge, `UIDocumentPicker` with security-scoped files | Covers most of Phase 2. |
+| Touch | 1 finger = left mouse, 2 fingers = orbit, pinch = zoom, 3 fingers = pan, double tap = right click | A reasonable baseline for §0.4. |
+| Pencil | Pressure (`force/maximumPossibleForce`), tilt (azimuth/altitude), hover, Pencil-vs-finger separation, double-tap = right click | **Basic only.** Missing: `coalescedTouches` (240 Hz), `predictedTouches`, estimated-property updates, `rollAngle`, squeeze, eraser toggle, pressure curve, "only Pencil draws". |
+| GPU | Metal viewport with iOS capability flags (`mtl_platform_ios.hh`), EEVEE and Workbench on the simulator. Cycles CPU proven. Cycles Metal compiled but only enabled on tier-2 GPUs (M-series qualifies) | Matches §0.5. |
+| Python | CPython 3.13.13, NumPy 2.3.4, zstandard. The extensions downloader was moved to a worker thread | Matches §0.2/§0.3. It keeps online extensions working, which carries App Review risk under 2.5.2. |
+| Missing | Memory-warning handling, background-task handling (none found), USD Hydra (off), OSL | Gaps from §0.3/§0.6. |
+| **Validation** | **Simulator only.** Their device IPA is deliberately **unsigned** and **has never been launched on real hardware.** Pencil, Cycles Metal, memory/jetsam and thermal behavior are all open "owner-signed" gates. | **Real-device validation is the biggest open gap, and we are well placed to close it** (paid developer account plus TestFlight). |
+
+**What it means for us:**
+1. **Do not start from scratch.** Our Phase 1a/1b and most of Phase 2 already exist.
+2. **Pick a base:**
+   - **(A) Fork theirs.** Fastest route to a device build. We inherit 5.2.0 and their process
+     tooling, which is tied to one specific build Mac.
+   - **(B) Forward-port their shims onto this repo's `main`.** Their design keeps iOS logic in
+     separate `*IOS*` files with small upstream hooks (see `PORT_MAP.tsv`, 214 files), so this is
+     feasible but costs weeks.
+   - **(C) Contribute upstream to them** (or to the official `ios` branch).
+3. **Our value-add, in order:** signed device builds and TestFlight → real-device gates
+   (Pencil, Metal Cycles, memory) → first-class Pencil from §0.4 → memory and background handling →
+   a policy-safe extensions mode.
+
 ---
 
 ## 1. Current state in the codebase
